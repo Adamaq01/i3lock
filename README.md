@@ -1,6 +1,8 @@
 i3lock
 ======
 
+**Screnshots are not reflective of the fork nor is the description below :)**
+
 This is my own copy of i3lock, consisting of the following tweaks: 
 - Display changes on key-strokes and escape/backspace.
 - Added 12-hour clock to the unlock indicator and periodic updater so time stays relevant. 
