@@ -40,6 +40,11 @@
 #endif
 #include <xcb/xcb_aux.h>
 #include <xcb/randr.h>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
+#endif
 
 #include "i3lock.h"
 #include "xcb.h"
@@ -47,6 +52,9 @@
 #include "unlock_indicator.h"
 #include "randr.h"
 #include "dpi.h"
+
+/* DBus */
+#include "sd-bus.h"
 
 #define TSTAMP_N_SECS(n) (n * 1.0)
 #define TSTAMP_N_MINS(n) (60 * TSTAMP_N_SECS(n))
@@ -66,10 +74,8 @@ char verifycolor[7] = "00ff00"; // verify
 char wrongcolor[7] = "ff0000"; // wrong
 char idlecolor[7] = "000000"; // idle
 
-/* Time format */
-bool use24hour = false;
+int authorized_time = 60;
 
-int inactivity_timeout = 30;
 uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
@@ -108,6 +114,20 @@ bool tile = false;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
 
+time_t lock_time;
+time_t curtime;
+time_t locked_time;
+static struct ev_periodic *time_status_tick;
+bool dbus_failed = false;
+
+/* Buf for the login*/
+char login_buf[64];
+char *login = login_buf;
+
+/* Session Id */
+char session_id_buf[16];
+char *session_id = session_id_buf;
+
 /* isutf, u8_dec © 2005 Jeff Bezanson, public domain */
 #define isutf(c) (((c)&0xC0) != 0x80)
 
@@ -117,6 +137,16 @@ bool skip_repeated_empty_password = false;
  */
 void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
+}
+
+/*
+ * Get the login of the user in order to display it while drawing the screen
+ *
+ */
+static char *get_login(void) {
+    uid_t uid = getuid();
+    struct passwd *pwd = getpwuid(uid);
+    return pwd ? pwd->pw_name : NULL;
 }
 
 /*
@@ -402,10 +432,12 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     char buffer[128];
     int n;
     bool ctrl;
+    bool mod;
     bool composed = false;
 
     ksym = xkb_state_key_get_one_sym(xkb_state, event->detail);
     ctrl = xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_DEPRESSED);
+    mod = xkb_state_mod_name_is_active(xkb_state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_DEPRESSED);
 
     /* The buffer will be null-terminated, so n >= 2 for 1 actual character. */
     memset(buffer, '\0', sizeof(buffer));
@@ -431,6 +463,17 @@ static void handle_key_press(xcb_key_press_event_t *event) {
 
     if (!composed) {
         n = xkb_keysym_to_utf8(ksym, buffer, sizeof(buffer));
+    }
+
+    switch (ksym) {
+        case XKB_KEY_E:
+            if (mod) {
+                time_t curtime = time(NULL);
+                time_t locked_time = difftime(curtime, lock_time) / 60;
+                if (locked_time >= authorized_time)
+                    terminate_current_session();
+            }
+            break;
     }
 
     switch (ksym) {
@@ -1015,6 +1058,34 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
+void identify_and_set_lock_status(void) {
+    if (!dbus_failed)
+    {
+        enum status new_status = LOCKED;
+        time_t curtime = time(NULL);
+        time_t locked_time = difftime(curtime, lock_time) / 60;
+        if (locked_time >= authorized_time)
+            new_status = LOCKED_OVERTIME;
+        dbus_failed = set_lock_status(session_id, new_status);
+    }
+}
+
+static void time_status_cb(struct ev_loop *loop, ev_periodic *w, int revents) {
+    identify_and_set_lock_status();
+}
+
+void start_time_status_tick(struct ev_loop* main_loop) {
+    if (time_status_tick) {
+        ev_periodic_set(time_status_tick, 1.0, 15., 0);
+        ev_periodic_again(main_loop, time_status_tick);
+    } else {
+        if (!(time_status_tick = calloc(sizeof(struct ev_periodic), 1)))
+            return;
+        ev_periodic_init(time_status_tick, time_status_cb, 1.0, 15., 0);
+        ev_periodic_start(main_loop, time_status_tick);
+    }
+}
+
 int verify_hex(char *arg, char *colortype, char *varname) {
     /* Skip # if present */
     if (arg[0] == '#') {
@@ -1039,6 +1110,10 @@ int main(int argc, char *argv[]) {
     int ret;
     struct pam_conv conv = {conv_callback, NULL};
 #endif
+#if defined(__linux__)
+    bool lock_tty_switching = false;
+    int term = -1;
+#endif
     int curs_choice = CURS_NONE;
     int o;
     int longoptind = 0;
@@ -1046,7 +1121,7 @@ int main(int argc, char *argv[]) {
         {"version", no_argument, NULL, 'v'},
         {"nofork", no_argument, NULL, 'n'},
         {"beep", no_argument, NULL, 'b'},
-        {"dpms", no_argument, NULL, 'd'},
+        {"lock-tty-switching", no_argument, NULL, 's'},
         {"color", required_argument, NULL, 'c'},
         {"pointer", required_argument, NULL, 'p'},
         {"debug", no_argument, NULL, 0},
@@ -1061,7 +1136,6 @@ int main(int argc, char *argv[]) {
         {"verify-color", required_argument, NULL, 'o'},
         {"wrong-color", required_argument, NULL, 'w'},
         {"idle-color", required_argument, NULL, 'l'},
-        {"24", no_argument, NULL, '4'},
         {NULL, no_argument, NULL, 0}
     };
 
@@ -1070,7 +1144,7 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL)
         errx(EXIT_FAILURE, "pw->pw_name is NULL.");
 
-    char *optstring = "hvnbdc:o:w:l:p:ui:teI:f";
+    char *optstring = "hvnbsc:o:w:l:p:ui:teI:f";
     while ((o = getopt_long(argc, argv, optstring, longopts, &optind)) != -1) {
         switch (o) {
             case 'v':
@@ -1081,11 +1155,11 @@ int main(int argc, char *argv[]) {
             case 'b':
                 beep = true;
                 break;
-            case 'd':
-                fprintf(stderr, "DPMS support has been removed from i3lock. Please see the manpage i3lock(1).\n");
+            case 's':
+                lock_tty_switching = true;
                 break;
             case 'I': {
-                fprintf(stderr, "Inactivity timeout only makes sense with DPMS, which was removed. Please see the manpage i3lock(1).\n");
+                authorized_time = atoi(optarg);
                 break;
             }
             case 'c': 
@@ -1099,9 +1173,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 'l':
                 verify_hex(optarg,idlecolor, "idlecolor");
-                break;
-            case '4':
-                use24hour = true;
                 break;
             case 'u':
                 unlock_indicator = false;
@@ -1135,7 +1206,7 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-o color] [-w color] [-l color] [-u] [-p win|default]"
-                " [-i image.png] [-t] [-e] [-I timeout] [-f] [--24]"
+                " [-i image.png] [-t] [-e] [-I timeout] [-f]"
                 );
         }
     }
@@ -1143,6 +1214,12 @@ int main(int argc, char *argv[]) {
     /* We need (relatively) random numbers for highlighting a random part of
      * the unlock indicator upon keypresses. */
     srand(time(NULL));
+
+    /* We need to save the current time in order to display the time when
+     * the computer was locked. Since this could lead to our PRNG seed being
+     * visible to the user, we should make sure that we're not using rand()
+     * for anything important (spoiler: we aren't). */
+    lock_time = time(NULL);
 
 #ifndef __OpenBSD__
     /* Initialize PAM */
@@ -1303,10 +1380,34 @@ int main(int argc, char *argv[]) {
      * keyboard. */
     (void)load_keymap();
 
+    /* Fill the buffer with the user login */
+    login = get_login();
+
+    /* Fill the buffer with the current session_id */
+    dbus_failed = get_session_id(session_id);
+
+    if (!dbus_failed)
+        identify_and_set_lock_status();
+
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;
     if (main_loop == NULL)
         errx(EXIT_FAILURE, "Could not initialize libev. Bad LIBEV_FLAGS?");
+
+#if defined(__linux__)
+
+    /* Lock tty switching */
+    if (lock_tty_switching) {
+        if ((term = open("/dev/console", O_RDWR)) == -1) {
+            perror("error locking TTY switching: opening console failed");
+        }
+
+        if (term != -1 && (ioctl(term, VT_LOCKSWITCH)) == -1) {
+            perror("error locking TTY switching: locking console failed");
+        }
+    }
+
+#endif
 
     /* Explicitly call the screen redraw in case "locking…" message was displayed */
     auth_state = STATE_AUTH_IDLE;
@@ -1330,6 +1431,7 @@ int main(int argc, char *argv[]) {
      * file descriptor becomes readable). */
     ev_invoke(main_loop, xcb_check, 0);
 
+    start_time_status_tick(main_loop);
     start_time_redraw_tick(main_loop);
 
     ev_loop(main_loop, 0);
@@ -1338,12 +1440,26 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+#if defined(__linux__)
+    /* Restore tty switching */
+    if (lock_tty_switching) {
+        if (term != -1 && (ioctl(term, VT_UNLOCKSWITCH)) == -1) {
+            perror("error unlocking TTY switching: unlocking console failed");
+        }
+        close(term);
+    }
+
+#endif
+
     DEBUG("restoring focus to X11 window 0x%08x\n", stolen_focus);
     xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
     xcb_ungrab_keyboard(conn, XCB_CURRENT_TIME);
     xcb_destroy_window(conn, win);
     set_focused_window(conn, screen->root, stolen_focus);
     xcb_aux_sync(conn);
+
+    if (!dbus_failed)
+        set_lock_status(session_id, UNLOCKED);
 
     return 0;
 }

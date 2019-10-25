@@ -22,7 +22,8 @@ i3lock_CFLAGS = \
 	$(XCB_UTIL_XRM_CFLAGS) \
 	$(XKBCOMMON_CFLAGS) \
 	$(CAIRO_CFLAGS) \
-	$(CODE_COVERAGE_CFLAGS)
+	$(CODE_COVERAGE_CFLAGS) \
+	`pkg-config --cflags --libs libsystemd`
 
 i3lock_CPPFLAGS = \
 	$(AM_CPPFLAGS) \
@@ -48,7 +49,8 @@ i3lock_SOURCES = \
 	unlock_indicator.c \
 	unlock_indicator.h \
 	xcb.c \
-	xcb.h
+	xcb.h \
+	sd-bus.c
 
 EXTRA_DIST = \
 	$(pamd_files) \
@@ -56,3 +58,7 @@ EXTRA_DIST = \
 	LICENSE \
 	README.md \
 	I3LOCK_VERSION
+
+# SUID the executable so it has permissions to lock TTY switching
+install-exec-hook:
+	chmod +s $(DESTDIR)$(bindir)/i3lock$(EXEEXT)

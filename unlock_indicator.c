@@ -27,8 +27,6 @@
 #define BUTTON_SPACE (BUTTON_RADIUS + 5)
 #define BUTTON_CENTER (BUTTON_RADIUS + 5)
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
-#define TIME_FORMAT_12 "%l:%M %p"
-#define TIME_FORMAT_24 "%k:%M"
 
 /*******************************************************************************
  * Variables defined in i3lock.c.
@@ -73,13 +71,22 @@ extern char wrongcolor[7];
 extern char idlecolor[7];
 
 /* Use 24 hour time format */
-extern bool use24hour;
+extern int authorized_time;
 
 /* Whether the failed attempts should be displayed. */
 extern bool show_failed_attempts;
 
 /* Number of failed unlock attempts. */
 extern int failed_attempts;
+
+/* When was the computer locked. */
+extern time_t lock_time;
+
+/* tick for timer */
+static struct ev_periodic *time_redraw_tick;
+
+/* Login */
+extern char *login;
 
 /*******************************************************************************
  * Variables defined in xcb.c.
@@ -186,6 +193,10 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         cairo_fill(xcb_ctx);
     }
 
+    /* Compute the locked_time */
+    time_t curtime = time(NULL);
+    time_t locked_time = difftime(curtime, lock_time) / 60;
+
     if (unlock_indicator) {
         cairo_scale(ctx, scaling_factor, scaling_factor);
         /* Draw a (centered) circle with transparent background. */
@@ -234,32 +245,39 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
         cairo_stroke(ctx);
 
         /* Display (centered) Time */
-        char *timetext = malloc(6);
+        char *text = malloc(100);
 
-        time_t curtime = time(NULL);
-        struct tm *tm = localtime(&curtime);
-        if (use24hour)
-            strftime(timetext, 100, TIME_FORMAT_24, tm);
-        else
-            strftime(timetext, 100, TIME_FORMAT_12, tm);
+        /* set time display */
+        snprintf(text, 100, "%.2lu:%.2lu", locked_time / 60, locked_time % 60);
 
         /* Text */
         set_auth_color('l');
         cairo_set_font_size(ctx, 32.0);
 
-        cairo_text_extents_t time_extents;
-        double time_x, time_y;
+        cairo_text_extents_t extents;
+        double x, y;
         //cairo_select_font_face(ctx, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 
-        cairo_text_extents(ctx, timetext, &time_extents);
-        time_x = BUTTON_CENTER - ((time_extents.width / 2) + time_extents.x_bearing);
-        time_y = BUTTON_CENTER - ((time_extents.height / 2) + time_extents.y_bearing);
+        cairo_text_extents(ctx, text, &extents);
+        x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+        y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing);
 
-        cairo_move_to(ctx, time_x, time_y);
-        cairo_show_text(ctx, timetext);
+        cairo_move_to(ctx, x, y);
+        cairo_show_text(ctx, text);
         cairo_close_path(ctx);
 
-        free(timetext);
+        free(text);
+
+        if (login != NULL)
+        {
+            cairo_set_font_size(ctx, 14.0);
+            cairo_text_extents(ctx, login, &extents);
+            x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+            y = y - extents.y_bearing + 12;
+            cairo_move_to(ctx, x, y);
+            cairo_show_text(ctx, login);
+            cairo_close_path(ctx);
+        }
 
         if (auth_state == STATE_AUTH_WRONG && (modifier_string != NULL)) {
             cairo_text_extents_t extents;
